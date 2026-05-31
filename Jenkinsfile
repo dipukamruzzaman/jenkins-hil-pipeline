@@ -28,10 +28,8 @@ pipeline {
         stage('Start Simulator') {
             steps {
                 echo 'Starting device simulator...'
-                bat '''
-                    start /B python app\\device_simulator.py > simulator.log 2>&1
-                    timeout /t 3 /nobreak > nul
-                '''
+                bat 'start /B python app\\device_simulator.py > simulator.log 2>&1'
+                bat 'python -c "import time; time.sleep(3)"'
                 bat 'python -c "import urllib.request; print(urllib.request.urlopen(\'http://localhost:8766/health\').read().decode())"'
                 echo 'Simulator running.'
             }
