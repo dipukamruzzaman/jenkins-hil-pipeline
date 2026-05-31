@@ -1,0 +1,17 @@
+# Python compiled files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Pytest cache and reports
+.pytest_cache/
+reports/
+*.html
+
+# Environment
+.env
+*.env
+
+# Jenkins
+.jenkins/
