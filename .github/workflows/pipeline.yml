@@ -1,0 +1,348 @@
+# =============================================================================
+# GitHub Actions Pipeline — jenkins-hil-pipeline
+#
+# Triggers:
+#   pull_request  → Stages 1-4 (fast feedback — no soak)
+#   push to main  → Stages 1-4 (full validation)
+#   nightly 2AM   → All stages including soak test
+# =============================================================================
+
+name: QA Pipeline — Parallel Tests · HIL · Quality Gate
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 2 * * *"    # nightly at 2AM
+  workflow_dispatch:         # manual trigger
+
+jobs:
+
+# =============================================================================
+# STAGE 1 — START DEVICE SIMULATOR
+# Starts the simulator as a background service.
+# All subsequent stages depend on it being healthy.
+# =============================================================================
+  start-simulator:
+    name: Start Device Simulator
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install Playwright browsers
+        run: python -m playwright install chromium
+
+      - name: Start simulator in background
+        run: |
+          nohup python app/device_simulator.py > simulator.log 2>&1 &
+          echo $! > simulator.pid
+          sleep 3
+
+      - name: Confirm simulator is healthy
+        run: |
+          python -c "
+          import urllib.request, sys
+          try:
+              resp = urllib.request.urlopen('http://localhost:8766/health', timeout=5)
+              print('Health:', resp.read().decode())
+          except Exception as e:
+              print('Simulator not ready:', e)
+              sys.exit(1)
+          "
+
+      - name: Upload simulator pid
+        uses: actions/upload-artifact@v4
+        with:
+          name: simulator-pid
+          path: simulator.pid
+
+
+# =============================================================================
+# STAGE 2 — PARALLEL TEST MATRIX
+# API tests and UI tests run simultaneously.
+# fail-fast: false — both suites complete even if one fails.
+# You need the full picture, not just the first failure.
+# =============================================================================
+  parallel-tests:
+    name: "${{ matrix.suite }} tests"
+    runs-on: ubuntu-latest
+    needs: start-simulator
+
+    strategy:
+      fail-fast: false          # both suites run even if one fails
+      matrix:
+        suite: [api, ui]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install Playwright browsers
+        run: python -m playwright install chromium
+
+      - name: Start simulator (each job needs its own)
+        run: |
+          nohup python app/device_simulator.py > simulator.log 2>&1 &
+          sleep 3
+          python -c "import urllib.request; urllib.request.urlopen('http://localhost:8766/health')"
+
+      - name: Run API tests
+        if: matrix.suite == 'api'
+        run: |
+          python -m pytest tests/test_api.py \
+            -v \
+            --junitxml=reports/api-results.xml
+        env:
+          DEVICE_HOST: localhost
+          DEVICE_PORT: "8766"
+
+      - name: Run UI tests
+        if: matrix.suite == 'ui'
+        run: |
+          python -m pytest tests/test_ui.py \
+            -v \
+            --junitxml=reports/ui-results.xml
+        env:
+          DEVICE_HOST: localhost
+          DEVICE_PORT: "8766"
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: "${{ matrix.suite }}-results"
+          path: reports/
+          retention-days: 30
+
+
+# =============================================================================
+# STAGE 3 — HIL VIRTUALISED TESTS
+# Runs after both parallel suites complete.
+# Uses device simulator as the virtual HIL device.
+# Skipped on PR — runs on merge to main and nightly.
+# =============================================================================
+  hil-virtualised:
+    name: HIL Virtualised Tests
+    runs-on: ubuntu-latest
+    needs: parallel-tests
+
+    if: |
+      github.ref == 'refs/heads/main' ||
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Start simulator
+        run: |
+          nohup python app/device_simulator.py > simulator.log 2>&1 &
+          sleep 3
+          python -c "import urllib.request; urllib.request.urlopen('http://localhost:8766/health')"
+
+      - name: Run HIL virtualised tests
+        run: |
+          python -m pytest tests/test_hil_virtual.py \
+            -v \
+            --junitxml=reports/hil-results.xml
+        env:
+          DEVICE_HOST:       localhost
+          DEVICE_PORT:       "8766"
+          EXPECTED_FIRMWARE: "fw-2.4.1-release"
+
+      - name: Upload HIL results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hil-results
+          path: reports/hil-results.xml
+          retention-days: 30
+
+
+# =============================================================================
+# STAGE 4 — QUALITY GATE
+# Evaluates all test results together.
+# Tier 1 — CRITICAL: hard block — any test failure blocks promotion
+# Tier 2 — MEDIUM:   soft block — requires sign-off (simulated here)
+# Tier 3 — LOW:      warning only — logged, never blocks
+# =============================================================================
+  quality-gate:
+    name: Quality Gate
+    runs-on: ubuntu-latest
+    needs: [parallel-tests, hil-virtualised]
+
+    # Run quality gate even if hil-virtualised was skipped
+    if: always()
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download all test results
+        uses: actions/download-artifact@v4
+        with:
+          path: all-reports/
+
+      - name: Evaluate quality gate
+        run: |
+          python -c "
+          import os
+          import xml.etree.ElementTree as ET
+          import sys
+
+          print('==========================================')
+          print('QUALITY GATE EVALUATION')
+          print('==========================================')
+
+          reports_dir = 'all-reports'
+          total_tests   = 0
+          total_failures = 0
+          total_errors   = 0
+          suites_found   = []
+
+          # Parse all JUnit XML result files
+          for root, dirs, files in os.walk(reports_dir):
+              for f in files:
+                  if f.endswith('.xml'):
+                      path = os.path.join(root, f)
+                      try:
+                          tree = ET.parse(path)
+                          r    = tree.getroot()
+
+                          # Handle both testsuite and testsuites root elements
+                          if r.tag == 'testsuites':
+                              suites = r.findall('testsuite')
+                          else:
+                              suites = [r]
+
+                          for suite in suites:
+                              tests    = int(suite.get('tests',    0))
+                              failures = int(suite.get('failures', 0))
+                              errors   = int(suite.get('errors',   0))
+                              name     = suite.get('name', f)
+
+                              total_tests    += tests
+                              total_failures += failures
+                              total_errors   += errors
+                              suites_found.append(name)
+
+                              print(f'Suite: {name}')
+                              print(f'  Tests: {tests} | Failures: {failures} | Errors: {errors}')
+                      except Exception as e:
+                          print(f'Could not parse {path}: {e}')
+
+          print('')
+          print(f'TOTAL: {total_tests} tests | {total_failures} failures | {total_errors} errors')
+          print('')
+
+          # ── Tier 1: CRITICAL — hard block ────────────────────────────
+          if total_failures > 0 or total_errors > 0:
+              print('┌─────────────────────────────────────────┐')
+              print('│  TIER 1 — CRITICAL FAILURE              │')
+              print('│  Test failures detected                 │')
+              print('│  Hard block — merge not permitted       │')
+              print('└─────────────────────────────────────────┘')
+              sys.exit(1)
+
+          # ── Tier 2: MEDIUM — soft block ───────────────────────────────
+          # In real pipeline this reads from SAST/SBOM output
+          # Simulated here with 0 medium findings
+          medium_findings = 0
+          if medium_findings > 0:
+              print(f'TIER 2 WARNING: {medium_findings} medium findings')
+              print('Soft block — set QUALITY_GATE_OVERRIDE=true to proceed')
+              sys.exit(1)
+
+          # ── Tier 3: LOW — warning only ────────────────────────────────
+          low_findings = 0
+          if low_findings > 0:
+              print(f'TIER 3 INFO: {low_findings} low severity findings — logged only')
+
+          print('==========================================')
+          print('QUALITY GATE PASSED')
+          print(f'All {total_tests} tests passing')
+          print('Build approved for promotion')
+          print('==========================================')
+          "
+
+
+# =============================================================================
+# STAGE 5 — NIGHTLY SOAK TEST
+# Runs only on nightly cron trigger.
+# 2-minute soak locally — set SOAK_MINUTES=30 for real nightly.
+# =============================================================================
+  nightly-soak:
+    name: Nightly Soak Test
+    runs-on: ubuntu-latest
+    needs: quality-gate
+
+    if: github.event_name == 'schedule'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Start simulator
+        run: |
+          nohup python app/device_simulator.py > simulator.log 2>&1 &
+          sleep 3
+          python -c "import urllib.request; urllib.request.urlopen('http://localhost:8766/health')"
+
+      - name: Run soak test
+        run: |
+          python -m pytest soak/test_soak.py \
+            -v -s \
+            --junitxml=reports/soak-results.xml
+        env:
+          DEVICE_HOST:  localhost
+          DEVICE_PORT:  "8766"
+          SOAK_MINUTES: "30"
+
+      - name: Upload soak results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: soak-results
+          path: reports/soak-results.xml
+          retention-days: 90
